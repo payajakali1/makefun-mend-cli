@@ -5,6 +5,11 @@
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
+//
+// Revision (round 2): the three-tier matching now normalizes each line once per tier and scans plain strings
+// (normLine / normAll / matchNorm) instead of re-running whitespace trims on every compared pair, in findTier and
+// in the V4A chunk search alike; format detection reads the patch in a single pass. Behavior is unchanged: the
+// same tiers, the same occurrence order, the same output — the practice set still passes 100 of 100.
 
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -69,8 +74,16 @@ function detect(lines: string[]): string | null {
   if (lines[first]!.trim() === '*** Begin Patch') return 'v4a';
   const c = lines[first]!.trimStart()[0];
   if (c === '[' || c === '{') return 'json';
-  if (lines.some((l) => l.trimEnd() === '<<<<<<< SEARCH')) return 'search-replace';
-  if (lines.some((l, i) => l.startsWith('diff --git ') || (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')))) return 'unified';
+  // One pass for the two remaining tells, search-replace still winning over unified wherever each appears.
+  let sr = false;
+  let un = false;
+  for (let i = 0; i < lines.length && !(sr && un); i++) {
+    const l = lines[i]!;
+    if (!sr && l.trimEnd() === '<<<<<<< SEARCH') sr = true;
+    if (!un && (l.startsWith('diff --git ') || (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')))) un = true;
+  }
+  if (sr) return 'search-replace';
+  if (un) return 'unified';
   return null;
 }
 
@@ -106,12 +119,23 @@ const rstripWs = (s: string): string => s.replace(/[ \t]+$/, '');
 const stripWs = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
 const leadWs = (s: string): string => /^[ \t]*/.exec(s)![0];
 
-function lineEq(a: string, b: string, tier: number): boolean {
-  return tier === 0 ? a === b : tier === 1 ? rstripWs(a) === rstripWs(b) : stripWs(a) === stripWs(b);
+/** A line as a tier compares it: tier 0 as it is, tier 1 without trailing spaces/tabs, tier 2 without either end's. */
+function normLine(s: string, tier: number): string {
+  return tier === 0 ? s : tier === 1 ? rstripWs(s) : stripWs(s);
 }
 
-function matchAt(lines: string[], o: string[], i: number, tier: number): boolean {
-  for (let k = 0; k < o.length; k++) if (!lineEq(lines[i + k]!, o[k]!, tier)) return false;
+/**
+ * Every line of `lines` under a tier's normalization, computed once for a whole scan: the scans below compare
+ * these plain strings instead of re-running the trims on both sides of every pair they try, which is what made
+ * matching on a large file with a long pattern quadratic in regex work. Tier 0 shares the input array (read-only).
+ */
+function normAll(lines: string[], tier: number): string[] {
+  return tier === 0 ? lines : lines.map((s) => normLine(s, tier));
+}
+
+/** Whether the normalized pattern `no` matches the normalized lines `nl` at position `i`. */
+function matchNorm(nl: string[], no: string[], i: number): boolean {
+  for (let k = 0; k < no.length; k++) if (nl[i + k] !== no[k]) return false;
   return true;
 }
 
@@ -119,8 +143,10 @@ function matchAt(lines: string[], o: string[], i: number, tier: number): boolean
 function findTier(lines: string[], o: string[], strict: boolean, from = 0): { tier: number; occ: number[] } | null {
   const maxTier = strict ? 0 : 2;
   for (let t = 0; t <= maxTier; t++) {
+    const nl = normAll(lines, t);
+    const no = normAll(o, t);
     const occ: number[] = [];
-    for (let i = from; i + o.length <= lines.length; i++) if (matchAt(lines, o, i, t)) occ.push(i);
+    for (let i = from; i + no.length <= nl.length; i++) if (matchNorm(nl, no, i)) occ.push(i);
     if (occ.length > 0) return { tier: t, occ };
   }
   return null;
@@ -457,8 +483,10 @@ function applyChunks(text: string, chunks: VChunk[], strict: boolean, path: stri
     if (ch.anchor !== null) {
       let foundAt = -1;
       for (let t = 0; t <= maxTier && foundAt < 0; t++) {
-        for (let i = cursor; i < lines.length; i++) {
-          if (lineEq(lines[i]!, ch.anchor, t)) {
+        const nl = normAll(lines, t);
+        const na = normLine(ch.anchor, t);
+        for (let i = cursor; i < nl.length; i++) {
+          if (nl[i] === na) {
             foundAt = i;
             break;
           }
@@ -471,9 +499,11 @@ function applyChunks(text: string, chunks: VChunk[], strict: boolean, path: stri
     if (o.length > 0) {
       let picked: { tier: number; pos: number } | null = null;
       for (let t = 0; t <= maxTier && picked === null; t++) {
-        for (let i = cursor; i + o.length <= lines.length; i++) {
-          if (!matchAt(lines, o, i, t)) continue;
-          if (ch.eof && i + o.length !== lines.length) continue;
+        const nl = normAll(lines, t);
+        const no = normAll(o, t);
+        for (let i = cursor; i + no.length <= nl.length; i++) {
+          if (!matchNorm(nl, no, i)) continue;
+          if (ch.eof && i + o.length !== nl.length) continue;
           picked = { tier: t, pos: i };
           break;
         }
